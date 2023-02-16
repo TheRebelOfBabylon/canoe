@@ -1,41 +1,82 @@
 package canoe
 
 import (
+	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"sync"
 
+	bg "github.com/SSSOCPaulCote/blunderguard"
 	"github.com/google/uuid"
 )
 
-type ConnectionStep uint8
-
 const (
-	HANDSHAKE_INIT ConnectionStep = iota
-	HANDSHAKE_ACK
-	TRANSFER_INIT
-	TRANSFER_ACK
-	COMPLETE
-	COMPLETE_ACK
+	ErrVersionMismatch = bg.Error("protocol version mismatch")
 )
 
+var (
+	defaultVersion uint8 = 0
+)
+
+type ServerConfig struct {
+	PrivateKey *rsa.PrivateKey
+	Rand       io.Reader
+}
+
 type Server struct {
+	Version   uint8
 	tcpLis    net.Listener
 	quit      chan struct{}
 	closeConn map[string]chan struct{}
 	wg        sync.WaitGroup
+	cfg       *ServerConfig
 }
 
 // NewServer creates a new instance of Server
-func NewServer() *Server {
-	return &Server{quit: make(chan struct{}), closeConn: make(map[string]chan struct{}, 0), wg: sync.WaitGroup{}}
+func NewServer(config *ServerConfig) *Server {
+	return &Server{
+		Version:   defaultVersion,
+		quit:      make(chan struct{}),
+		closeConn: make(map[string]chan struct{}, 0),
+		wg:        sync.WaitGroup{},
+		cfg:       config,
+	}
 }
 
 func (s *Server) handleResponse(resp TCPMsg) (TCPMsg, error) {
 	switch r := resp.(type) {
 	case HandshakeInit:
 		// check version compatibility
+
+	}
+}
+
+// parseBytes will parse the bytes received via TCP into a useable format
+func (s *Server) parseBytes(b []byte, key []byte) (TCPMsg, error) {
+	var f Frame
+	err := json.Unmarshal(b, &f)
+	if err != nil {
+		return nil, err
+	}
+	// base64 decode Payload
+	pay, err := base64.StdEncoding.DecodeString(f.Payload)
+	if err != nil {
+		return nil, err
+	}
+	switch f.Type {
+	case HANDSHAKE_INIT:
+		// check for version compatibility
+		resp := &HandshakeInit{}
+		err = json.Unmarshal(pay, &resp)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Version != s.Version {
+			return nil, ErrVersionMismatch
+		}
 		// decrypt handshake_key with pubkey
 		// decrypt payload with handshake_key
 
@@ -44,16 +85,6 @@ func (s *Server) handleResponse(resp TCPMsg) (TCPMsg, error) {
 		// make HandshakeAck message and serialize
 		// Encrypt
 		// Encode
-
-	}
-}
-
-// parseBytes will parse the bytes received via TCP into a useable format
-func parseBytes(b []byte, step ConnectionStep) (TCPMsg, error) {
-	var resp TCPMsg
-	switch step {
-	case HANDSHAKE_INIT:
-		resp = HandshakeInit{}
 	case HANDSHAKE_ACK:
 		// decrypt first
 		resp = HandshakeAck{}
@@ -66,10 +97,7 @@ func parseBytes(b []byte, step ConnectionStep) (TCPMsg, error) {
 	case COMPLETE_ACK:
 		resp = TransferCompleteAck{}
 	}
-	err := json.Unmarshal(b, &resp)
-	if err != nil {
-		return nil, err
-	}
+
 	return resp, nil
 }
 
@@ -81,7 +109,6 @@ func (s *Server) handleConnection(conn net.Conn, connId string) {
 		s.wg.Done()
 	}()
 	buffer := make([]byte, 1024)
-	var step ConnectionStep
 	for {
 		select {
 		case <-s.closeConn[connId]:
@@ -91,7 +118,7 @@ func (s *Server) handleConnection(conn net.Conn, connId string) {
 			if err != nil {
 				log.Println(err)
 			}
-			resp, err := parseBytes(buffer[:], step)
+			resp, err := parseBytes(buffer[:])
 			if err != nil {
 				log.Println(err)
 			}
