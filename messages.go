@@ -3,6 +3,7 @@ package canoe
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 )
 
 type MsgTypes uint8
@@ -17,6 +18,13 @@ const (
 	CLOSE
 	PING
 	PONG
+)
+
+type StatusTypes uint8
+
+const (
+	OK StatusTypes = iota
+	ERROR
 )
 
 type TCPMsg interface {
@@ -45,6 +53,10 @@ func (h HandshakeInit) Serialize() string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
+func (h HandshakeInit) String() string {
+	return fmt.Sprintf("Version=%v\nHandshakeKey=%s\nPayload=%s", h.Version, h.HandshakeKey, h.Payload)
+}
+
 // Message is encrypted with handshake key
 type HandshakeAck struct {
 	SessionKey string `json:"session_key"` // Server generated, symmetric key encrypted with client pubkey and hex encoded
@@ -54,6 +66,10 @@ type HandshakeAck struct {
 func (h HandshakeAck) Serialize() string {
 	b, _ := json.Marshal(h)
 	return base64.StdEncoding.EncodeToString(b)
+}
+
+func (h HandshakeAck) String() string {
+	return fmt.Sprintf("SessionKey=%s\nUDP Port=%v", h.SessionKey, h.UDPPort)
 }
 
 // encrypted with session key
@@ -68,15 +84,23 @@ func (t TransferInit) Serialize() string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
+func (t TransferInit) String() string {
+	return fmt.Sprintf("FileSize=%v\nFileName=%s\nNumberOfPackets=%v", t.FileSize, t.FileName, t.NumberOfPackets)
+}
+
 // encrypted with session key
 type TransferAck struct {
-	Status uint8  `json:"status"` // OK or ERR
-	Msg    string `json:"msg"`    // error message if
+	Status StatusTypes `json:"status"` // OK or ERR
+	Msg    string      `json:"msg"`    // error message if
 }
 
 func (t TransferAck) Serialize() string {
 	b, _ := json.Marshal(t)
 	return base64.StdEncoding.EncodeToString(b)
+}
+
+func (t TransferAck) String() string {
+	return fmt.Sprintf("Status=%v\nMsg=%s", t.Status, t.Msg)
 }
 
 // Packet encrypted with session key, sent over UDP

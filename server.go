@@ -1,9 +1,13 @@
 package canoe
 
 import (
+	"bytes"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -14,16 +18,23 @@ import (
 )
 
 const (
-	ErrVersionMismatch = bg.Error("protocol version mismatch")
+	ErrVersionMismatch  = bg.Error("protocol version mismatch")
+	ErrWeakHandshakeKey = bg.Error("weak handshake key")
 )
 
 var (
-	defaultVersion uint8 = 0
+	defaultVersion uint8  = 0
+	defaultUDPPort uint16 = 6969
 )
 
 type ServerConfig struct {
-	PrivateKey *rsa.PrivateKey
+	privateKey *rsa.PrivateKey
 	Rand       io.Reader
+}
+
+// AddHostKey is a method for registering a private key in the server config
+func (s *ServerConfig) AddHostKey(key *rsa.PrivateKey) {
+	s.privateKey = key
 }
 
 type Server struct {
@@ -46,70 +57,133 @@ func NewServer(config *ServerConfig) *Server {
 	}
 }
 
-func (s *Server) handleResponse(resp TCPMsg) (TCPMsg, error) {
-	switch r := resp.(type) {
-	case HandshakeInit:
-		// check version compatibility
-
-	}
-}
-
-// parseBytes will parse the bytes received via TCP into a useable format
-func (s *Server) parseBytes(b []byte, key []byte) (TCPMsg, error) {
-	var f Frame
-	err := json.Unmarshal(b, &f)
+// handleMsg will take the TCP message, decode and decrypt as necessary and then create the appropriate response
+func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte) ([]byte, error) {
+	var (
+		f Frame
+	)
+	err := json.Unmarshal(bytes.Trim(msgBytes, "\x00"), &f)
 	if err != nil {
 		return nil, err
 	}
 	// base64 decode Payload
-	pay, err := base64.StdEncoding.DecodeString(f.Payload)
+	encryptedPay, err := base64.StdEncoding.DecodeString(f.Payload)
 	if err != nil {
 		return nil, err
 	}
 	switch f.Type {
 	case HANDSHAKE_INIT:
-		// check for version compatibility
-		resp := &HandshakeInit{}
-		err = json.Unmarshal(pay, &resp)
+		// decrypt payload
+		rawPay, err := DecryptOAEP(sha256.New(), s.cfg.Rand, s.cfg.privateKey, encryptedPay, []byte(""))
 		if err != nil {
 			return nil, err
 		}
-		if resp.Version != s.Version {
-			return nil, ErrVersionMismatch
+		// decode decrypted paylaod
+		decodedRawPay, err := base64.StdEncoding.DecodeString(string(rawPay))
+		if err != nil {
+			return nil, err
 		}
-		// decrypt handshake_key with pubkey
-		// decrypt payload with handshake_key
-
-		// create session key
+		// unmarshall
+		// check for version compatibility
+		msg := HandshakeInit{}
+		err = json.Unmarshal(decodedRawPay, &msg)
+		if err != nil {
+			return nil, err
+		}
+		// check version compatibility
+		if msg.Version != s.Version {
+			return []byte{}, ErrVersionMismatch
+		}
+		// decode handshakekey
+		rawHK, err := base64.StdEncoding.DecodeString(msg.HandshakeKey)
+		if err != nil {
+			return []byte{}, err
+		}
+		// check if handshake key is at minimum 256 bits
+		if len(rawHK) < 32 {
+			return []byte{}, ErrWeakHandshakeKey
+		}
+		// decode encrypted pubkey
+		encryptedPubkey, err := base64.StdEncoding.DecodeString(msg.Payload)
+		if err != nil {
+			return []byte{}, err
+		}
+		pubkeyBytes, err := DecryptAESGCM(encryptedPubkey, rawHK)
+		if err != nil {
+			return []byte{}, err
+		}
 		// encrypt session key with client pubkey
+		pubkey, err := x509.ParsePKCS1PublicKey(pubkeyBytes)
+		if err != nil {
+			return []byte{}, err
+		}
+		encryptedSessKey, err := EncryptOAEP(sha256.New(), s.cfg.Rand, pubkey, sessionKey, []byte(""))
+		if err != nil {
+			return []byte{}, err
+		}
 		// make HandshakeAck message and serialize
-		// Encrypt
-		// Encode
-	case HANDSHAKE_ACK:
-		// decrypt first
-		resp = HandshakeAck{}
+		ack := HandshakeAck{
+			SessionKey: base64.StdEncoding.EncodeToString(encryptedSessKey),
+			UDPPort:    defaultUDPPort,
+		}
+		// Encrypt payload with handshake key
+		encryptedPayload, err := EncryptAESGCM([]byte(ack.Serialize()), rawHK)
+		if err != nil {
+			return []byte{}, err
+		}
+		frame := &Frame{
+			Type:    HANDSHAKE_ACK,
+			Payload: base64.StdEncoding.EncodeToString(encryptedPayload),
+		}
+		return frame.Serialize(), nil
 	case TRANSFER_INIT:
-		resp = TransferInit{}
-	case TRANSFER_ACK:
-		resp = TransferAck{}
-	case COMPLETE:
-		resp = TransferComplete{}
-	case COMPLETE_ACK:
-		resp = TransferCompleteAck{}
+		// decrypt payload using session key
+		rawPay, err := DecryptAESGCM(encryptedPay, sessionKey)
+		if err != nil {
+			return []byte{}, err
+		}
+		// decode decrypted paylaod
+		decodedRawPay, err := base64.StdEncoding.DecodeString(string(rawPay))
+		if err != nil {
+			return nil, err
+		}
+		// unmarshall
+		msg := TransferInit{}
+		err = json.Unmarshal(decodedRawPay, &msg)
+		if err != nil {
+			return []byte{}, err
+		}
+		// TODO - Implement this
+		fmt.Println(msg)
+		// Make TransferAck
+		ack := TransferAck{
+			Status: OK,
+		}
+		// Encrypt payload with session key
+		encryptedPayload, err := EncryptAESGCM([]byte(ack.Serialize()), sessionKey)
+		if err != nil {
+			return []byte{}, err
+		}
+		frame := &Frame{
+			Type:    TRANSFER_ACK,
+			Payload: base64.StdEncoding.EncodeToString(encryptedPayload),
+		}
+		return frame.Serialize(), nil
 	}
-
-	return resp, nil
+	return []byte{}, nil
 }
 
 // handleConnection is run as a go routine for every new connection
 func (s *Server) handleConnection(conn net.Conn, connId string) {
 	defer func() {
 		conn.Close()
-		close(s.closeConn[connId])
 		s.wg.Done()
 	}()
-	buffer := make([]byte, 1024)
+	// create session key
+	sessionKey := CreateAESKey()
+loop:
 	for {
+		buffer := make([]byte, 4096)
 		select {
 		case <-s.closeConn[connId]:
 			return
@@ -117,24 +191,18 @@ func (s *Server) handleConnection(conn net.Conn, connId string) {
 			_, err := conn.Read(buffer)
 			if err != nil {
 				log.Println(err)
+				break loop
 			}
-			resp, err := parseBytes(buffer[:])
+			resp, err := s.handleMsg(buffer[:], sessionKey)
 			if err != nil {
 				log.Println(err)
+				continue loop
 			}
-			step += 1
-			if step == COMPLETE_ACK {
-				return
-			}
-			req, err := s.handleResponse(resp)
+			_, err = conn.Write(resp)
 			if err != nil {
 				log.Println(err)
+				break loop
 			}
-			_, err = conn.Write(req.Serialize())
-			if err != nil {
-				log.Println(err)
-			}
-			step += 1
 		}
 	}
 
@@ -172,6 +240,7 @@ func (s *Server) Close() error {
 	for _, channel := range s.closeConn {
 		close(channel)
 	}
+	s.wg.Wait()
 	if s.tcpLis != nil {
 		return s.tcpLis.Close()
 	}
