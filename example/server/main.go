@@ -41,5 +41,5 @@ func main() {
 	}
 	defer server.Close()
 	fmt.Printf("Server listening on %v...\n", lis.Addr())
-	time.Sleep(30 * time.Second)
+	time.Sleep(300 * time.Second)
 }

@@ -2,8 +2,6 @@ package main
 
 import (
 	"crypto/rand"
-	"crypto/x509"
-	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 
@@ -39,20 +37,22 @@ func main() {
 		fmt.Println(err)
 		return
 	}
-	rawPubkeyBytes := x509.MarshalPKCS1PublicKey(pubkey)
-	encodedPubkey := base64.StdEncoding.EncodeToString(rawPubkeyBytes)
-	client, err := canoe.Dial(testServerAddr, encodedPubkey, cfg)
+	client, err := canoe.Dial(testServerAddr, pubkey, cfg)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	defer client.Close()
-	msg := canoe.TransferInit{
+	msg := canoe.FileTransferInit{
 		FileSize:        69,
 		FileName:        "boobies.txt",
 		NumberOfPackets: 420,
 	}
-	err = client.Send(&canoe.Frame{Type: canoe.TRANSFER_INIT, Payload: msg.Serialize()})
+	frame := canoe.TransferFrame{
+		Type:    canoe.FILE,
+		Payload: msg.Serialize(),
+	}
+	err = client.Send(frame.Serialize(), canoe.TRANSFER_INIT)
 	if err != nil {
 		fmt.Println(err)
 		return

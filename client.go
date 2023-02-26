@@ -2,14 +2,17 @@ package canoe
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 
 	bg "github.com/SSSOCPaulCote/blunderguard"
 )
@@ -39,7 +42,7 @@ type Client struct {
 
 // Dial starts a client connection to the given canoe server. It is a convenience function to the given network address
 // initiates the Seif handshake, and then sets up a Client.
-func Dial(addr, pubkey string, config *ClientConfig) (*Client, error) {
+func Dial(addr string, pubkey *rsa.PublicKey, config *ClientConfig) (*Client, error) {
 	// Ensure PrivateKey is not nil
 	if config.privateKey == nil {
 		return nil, ErrNoKeyFound
@@ -64,20 +67,17 @@ func Dial(addr, pubkey string, config *ClientConfig) (*Client, error) {
 	// encode encryptedPubkey and initialize HandshakeInit msg
 	msg := HandshakeInit{
 		Version:      defaultVersion,
-		HandshakeKey: base64.StdEncoding.EncodeToString(handshakeKey),
-		Payload:      base64.StdEncoding.EncodeToString(encryptedPubkey),
+		HandshakeKey: handshakeKey,
+		Payload:      encryptedPubkey,
 	}
-	// Unmarshall server pubkey
-	serverPubkeyBytes, err := base64.StdEncoding.DecodeString(pubkey)
+	// Sign message
+	sig, err := msg.Sign(config.privateKey, config.Rand)
 	if err != nil {
 		return nil, err
 	}
-	serverPubkey, err := x509.ParsePKCS1PublicKey(serverPubkeyBytes)
-	if err != nil {
-		return nil, err
-	}
+	msg.Signature = sig
 	// encrypt Msg with server pubkey
-	encryptedMsg, err := EncryptOAEP(sha256.New(), config.Rand, serverPubkey, []byte(msg.Serialize()), []byte(""))
+	encryptedMsg, err := EncryptOAEP(sha256.New(), config.Rand, pubkey, msg.Serialize(), []byte(""))
 	if err != nil {
 		return nil, err
 	}
@@ -104,58 +104,90 @@ func Dial(addr, pubkey string, config *ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if f.Type != HANDSHAKE_ACK {
+	switch f.Type {
+	case CLOSE:
+		return nil, handleClose(&f, handshakeKey)
+	case HANDSHAKE_ACK:
+		// decode payload
+		decodePay, err := base64.StdEncoding.DecodeString(f.Payload)
+		if err != nil {
+			return nil, err
+		}
+		// decrypt with handshake key
+		decryptedPay, err := DecryptAESGCM(decodePay, handshakeKey)
+		if err != nil {
+			return nil, err
+		}
+		// unmarshall ackframe
+		var ackFrame AckFrame
+		err = json.Unmarshal(decryptedPay, &ackFrame)
+		if err != nil {
+			return nil, err
+		}
+		if ackFrame.Status != OK {
+			return nil, errors.New(string(ackFrame.Payload))
+		}
+		// unmarshall ack
+		var ack HandshakeAck
+		err = json.Unmarshal(ackFrame.Payload, &ack)
+		if err != nil {
+			return nil, err
+		}
+		// Verify server signature
+		serialMsg := ack.serializeForSign()
+		hashedMsg := sha256.Sum256(serialMsg)
+		err = rsa.VerifyPSS(pubkey, crypto.SHA256, hashedMsg[:], ack.Signature, nil)
+		if err != nil {
+			return nil, err
+		}
+		sesskey, err := DecryptOAEP(sha256.New(), config.Rand, config.privateKey, ack.SessionKey, []byte(""))
+		if err != nil {
+			return nil, err
+		}
+		if len(sesskey) < 32 {
+			return nil, ErrWeakSessionkey
+		}
+		return &Client{
+			Version:    defaultVersion,
+			tcpConn:    conn,
+			cfg:        config,
+			sessionKey: sesskey[:],
+		}, nil
+	default:
 		return nil, ErrInvalidResponse
 	}
-	// decode payload
-	decodePay, err := base64.StdEncoding.DecodeString(f.Payload)
+}
+
+func handleClose(f *Frame, key []byte) error {
+	// Assume it's encrypted and encoded
+	encryptedBytes, err := base64.StdEncoding.DecodeString(f.Payload)
+	if err != nil && strings.Contains(err.Error(), "illegal base64 data at input byte") {
+		// assume it's clear text
+		return errors.New(f.Payload)
+	}
+	decryptedBytes, err := DecryptAESGCM(encryptedBytes, key)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("error when decrypting close message: %v", err)
 	}
-	// decrypt with handshake key
-	decryptedPay, err := DecryptAESGCM(decodePay, handshakeKey)
+	var ackFrame AckFrame
+	err = json.Unmarshal(decryptedBytes, &ackFrame)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("error when unpacking json: %v", err)
 	}
-	// deode decrypted msg
-	decodedDecryptedPay, err := base64.StdEncoding.DecodeString(string(decryptedPay))
-	if err != nil {
-		return nil, err
-	}
-	// unmarshall ack
-	var ack HandshakeAck
-	err = json.Unmarshal(decodedDecryptedPay, &ack)
-	if err != nil {
-		return nil, err
-	}
-	// decrypt session key with client pubkey
-	decodedEncryptedSessKey, err := base64.StdEncoding.DecodeString(ack.SessionKey)
-	if err != nil {
-		return nil, err
-	}
-	sesskey, err := DecryptOAEP(sha256.New(), config.Rand, config.privateKey, decodedEncryptedSessKey, []byte(""))
-	if err != nil {
-		return nil, err
-	}
-	if len(sesskey) < 32 {
-		return nil, ErrWeakSessionkey
-	}
-	return &Client{
-		Version:    defaultVersion,
-		tcpConn:    conn,
-		cfg:        config,
-		sessionKey: sesskey[:],
-	}, nil
+	return errors.New(string(ackFrame.Payload))
 }
 
 // Send sends a serialized message to the server
-func (c *Client) Send(unencryptedFrame *Frame) error {
-	encryptedPay, err := EncryptAESGCM([]byte(unencryptedFrame.Payload), c.sessionKey)
+func (c *Client) Send(pay []byte, msgType MsgTypes) error {
+	encryptedPay, err := EncryptAESGCM(pay, c.sessionKey)
 	if err != nil {
 		return err
 	}
-	unencryptedFrame.Payload = base64.StdEncoding.EncodeToString(encryptedPay)
-	_, err = c.tcpConn.Write(unencryptedFrame.Serialize())
+	frame := Frame{
+		Type:    msgType,
+		Payload: base64.StdEncoding.EncodeToString(encryptedPay),
+	}
+	_, err = c.tcpConn.Write(frame.Serialize())
 	if err != nil {
 		return err
 	}
@@ -165,16 +197,19 @@ func (c *Client) Send(unencryptedFrame *Frame) error {
 	if err != nil {
 		return err
 	}
-	switch unencryptedFrame.Type {
+	// unmarshall json
+	var f Frame
+	err = json.Unmarshal(bytes.Trim(buffer, "\x00"), &f)
+	if err != nil {
+		return err
+	}
+	if f.Type == CLOSE {
+		return handleClose(&f, c.sessionKey)
+	}
+	switch frame.Type {
 	case TRANSFER_INIT:
 		// then we expect a TransferAck
 		// Parse what should be ACK
-		// unmarshall json
-		var f Frame
-		err = json.Unmarshal(bytes.Trim(buffer, "\x00"), &f)
-		if err != nil {
-			return err
-		}
 		if f.Type != TRANSFER_ACK {
 			return ErrInvalidResponse
 		}
@@ -188,14 +223,19 @@ func (c *Client) Send(unencryptedFrame *Frame) error {
 		if err != nil {
 			return err
 		}
-		// deode decrypted msg
-		decodedDecryptedPay, err := base64.StdEncoding.DecodeString(string(decryptedPay))
+		// unmarshall ackframe
+		var ackFrame AckFrame
+		err = json.Unmarshal(decryptedPay, &ackFrame)
 		if err != nil {
 			return err
 		}
+		fmt.Println(ackFrame)
+		if ackFrame.Status != OK {
+			return errors.New(string(ackFrame.Payload))
+		}
 		// unmarshall ack
 		var ack TransferAck
-		err = json.Unmarshal(decodedDecryptedPay, &ack)
+		err = json.Unmarshal(ackFrame.Payload, &ack)
 		if err != nil {
 			return err
 		}

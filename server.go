@@ -2,6 +2,7 @@ package canoe
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -58,127 +59,152 @@ func NewServer(config *ServerConfig) *Server {
 }
 
 // handleMsg will take the TCP message, decode and decrypt as necessary and then create the appropriate response
-func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte) ([]byte, error) {
+func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte) (MsgTypes, []byte, error) {
 	var (
-		f Frame
+		f     Frame
+		frame Frame
+		fType MsgTypes
 	)
 	err := json.Unmarshal(bytes.Trim(msgBytes, "\x00"), &f)
 	if err != nil {
-		return nil, err
+		return CLOSE, nil, err
 	}
 	// base64 decode Payload
 	encryptedPay, err := base64.StdEncoding.DecodeString(f.Payload)
 	if err != nil {
-		return nil, err
+		return CLOSE, nil, err
 	}
 	switch f.Type {
 	case HANDSHAKE_INIT:
 		// decrypt payload
 		rawPay, err := DecryptOAEP(sha256.New(), s.cfg.Rand, s.cfg.privateKey, encryptedPay, []byte(""))
 		if err != nil {
-			return nil, err
-		}
-		// decode decrypted paylaod
-		decodedRawPay, err := base64.StdEncoding.DecodeString(string(rawPay))
-		if err != nil {
-			return nil, err
+			return createErrCloseFrameHandshake(err)
 		}
 		// unmarshall
 		// check for version compatibility
 		msg := HandshakeInit{}
-		err = json.Unmarshal(decodedRawPay, &msg)
+		err = json.Unmarshal(rawPay, &msg)
 		if err != nil {
-			return nil, err
+			return createErrCloseFrameHandshake(err)
 		}
 		// check version compatibility
 		if msg.Version != s.Version {
-			return []byte{}, ErrVersionMismatch
-		}
-		// decode handshakekey
-		rawHK, err := base64.StdEncoding.DecodeString(msg.HandshakeKey)
-		if err != nil {
-			return []byte{}, err
+			return createErrCloseFrameHandshake(ErrVersionMismatch)
 		}
 		// check if handshake key is at minimum 256 bits
-		if len(rawHK) < 32 {
-			return []byte{}, ErrWeakHandshakeKey
+		if len(msg.HandshakeKey) < 32 {
+			return createErrCloseFrameHandshake(ErrWeakHandshakeKey)
 		}
-		// decode encrypted pubkey
-		encryptedPubkey, err := base64.StdEncoding.DecodeString(msg.Payload)
+		pubkeyBytes, err := DecryptAESGCM(msg.Payload, msg.HandshakeKey)
 		if err != nil {
-			return []byte{}, err
+			return createErrCloseFrame(err, msg.HandshakeKey)
 		}
-		pubkeyBytes, err := DecryptAESGCM(encryptedPubkey, rawHK)
-		if err != nil {
-			return []byte{}, err
-		}
-		// encrypt session key with client pubkey
+		// encrypt session key with client pubkey and verify client signature
 		pubkey, err := x509.ParsePKCS1PublicKey(pubkeyBytes)
 		if err != nil {
-			return []byte{}, err
+			return createErrCloseFrame(err, msg.HandshakeKey)
 		}
-		encryptedSessKey, err := EncryptOAEP(sha256.New(), s.cfg.Rand, pubkey, sessionKey, []byte(""))
+		// verify client signature
+		serialMsg := msg.serializeForSign()
+		hashedMsg := sha256.Sum256(serialMsg)
+		err = rsa.VerifyPSS(pubkey, crypto.SHA256, hashedMsg[:], msg.Signature, nil)
 		if err != nil {
-			return []byte{}, err
+			return createErrCloseFrame(err, msg.HandshakeKey)
 		}
-		// make HandshakeAck message and serialize
+		encryptedSessKey, err := EncryptOAEP(sha256.New(), s.cfg.Rand, pubkey, sessionKey[:], []byte(""))
+		if err != nil {
+			return createErrCloseFrame(err, msg.HandshakeKey)
+		}
+		// make HandshakeAck message, sign and serialize
 		ack := HandshakeAck{
-			SessionKey: base64.StdEncoding.EncodeToString(encryptedSessKey),
-			UDPPort:    defaultUDPPort,
+			SessionKey: encryptedSessKey,
 		}
-		// Encrypt payload with handshake key
-		encryptedPayload, err := EncryptAESGCM([]byte(ack.Serialize()), rawHK)
+		sig, err := ack.Sign(s.cfg.privateKey, s.cfg.Rand)
 		if err != nil {
-			return []byte{}, err
+			return createErrCloseFrame(err, msg.HandshakeKey)
 		}
-		frame := &Frame{
-			Type:    HANDSHAKE_ACK,
-			Payload: base64.StdEncoding.EncodeToString(encryptedPayload),
+		ack.Signature = sig[:]
+		// Wrap ack in the AckFrame
+		ackFrame := AckFrame{
+			Status:  OK,
+			Payload: ack.Serialize(),
 		}
-		return frame.Serialize(), nil
+		// Encrypt ackFrame with handshake key
+		encryptedAckFrame, err := EncryptAESGCM(ackFrame.Serialize(), msg.HandshakeKey)
+		if err != nil {
+			return createErrCloseFrame(err, msg.HandshakeKey)
+		}
+		// encode encrypted ackFrame
+		fType = HANDSHAKE_ACK
+		frame.Type = HANDSHAKE_ACK
+		frame.Payload = base64.StdEncoding.EncodeToString(encryptedAckFrame)
 	case TRANSFER_INIT:
 		// decrypt payload using session key
 		rawPay, err := DecryptAESGCM(encryptedPay, sessionKey)
 		if err != nil {
-			return []byte{}, err
-		}
-		// decode decrypted paylaod
-		decodedRawPay, err := base64.StdEncoding.DecodeString(string(rawPay))
-		if err != nil {
-			return nil, err
+			return createErrCloseFrame(err, sessionKey)
 		}
 		// unmarshall
-		msg := TransferInit{}
-		err = json.Unmarshal(decodedRawPay, &msg)
+		msg := TransferFrame{}
+		err = json.Unmarshal(rawPay, &msg)
 		if err != nil {
-			return []byte{}, err
+			return createErrCloseFrame(err, sessionKey)
 		}
 		// TODO - Implement this
 		fmt.Println(msg)
 		// Make TransferAck
 		ack := TransferAck{
-			Status: OK,
+			UDPPort: defaultUDPPort,
+		}
+		// Wrap ack in the AckFrame
+		ackFrame := AckFrame{
+			Status:  OK,
+			Payload: ack.Serialize(),
 		}
 		// Encrypt payload with session key
-		encryptedPayload, err := EncryptAESGCM([]byte(ack.Serialize()), sessionKey)
+		encryptedPayload, err := EncryptAESGCM(ackFrame.Serialize(), sessionKey)
 		if err != nil {
-			return []byte{}, err
+			return createErrCloseFrame(err, sessionKey)
 		}
-		frame := &Frame{
-			Type:    TRANSFER_ACK,
-			Payload: base64.StdEncoding.EncodeToString(encryptedPayload),
-		}
-		return frame.Serialize(), nil
+		fType = TRANSFER_ACK
+		frame.Type = TRANSFER_ACK
+		frame.Payload = base64.StdEncoding.EncodeToString(encryptedPayload)
 	}
-	return []byte{}, nil
+	return fType, frame.Serialize(), nil
+}
+
+// createErrCloseFrameHandshake creates an unencrypted CLOSE message for the client
+// that contains an error status. It is used during the handshake phase
+func createErrCloseFrameHandshake(err error) (MsgTypes, []byte, error) {
+	return CLOSE, Frame{
+		Type:    CLOSE,
+		Payload: err.Error(),
+	}.Serialize(), err
+}
+
+// createErrCloseFrame creates a CLOSE message for the client that contains an error status
+func createErrCloseFrame(ogErr error, key []byte) (MsgTypes, []byte, error) {
+	// Create an error ack frame
+	ackFrame := AckFrame{
+		Status:  ERROR,
+		Payload: []byte(ogErr.Error()),
+	}
+	// encrypt
+	encryptedAck, err := EncryptAESGCM(ackFrame.Serialize(), key)
+	if err != nil {
+		return CLOSE, nil, err
+	}
+	// Wrap in a frame
+	return CLOSE, Frame{
+		Type:    CLOSE,
+		Payload: base64.StdEncoding.EncodeToString(encryptedAck),
+	}.Serialize(), ogErr
 }
 
 // handleConnection is run as a go routine for every new connection
 func (s *Server) handleConnection(conn net.Conn, connId string) {
-	defer func() {
-		conn.Close()
-		s.wg.Done()
-	}()
+	defer s.wg.Done()
 	// create session key
 	sessionKey := CreateAESKey()
 loop:
@@ -186,26 +212,36 @@ loop:
 		buffer := make([]byte, 4096)
 		select {
 		case <-s.closeConn[connId]:
-			return
+			break loop
 		default:
 			_, err := conn.Read(buffer)
-			if err != nil {
+			if err == io.EOF {
+				return
+			} else if err != nil {
 				log.Println(err)
 				break loop
 			}
-			resp, err := s.handleMsg(buffer[:], sessionKey)
+			fType, resp, err := s.handleMsg(buffer[:], sessionKey)
 			if err != nil {
 				log.Println(err)
-				continue loop
+				if fType != CLOSE {
+					fType, resp, err = createErrCloseFrameHandshake(err)
+					if err != nil {
+						log.Printf("error when trying to prepare a close error message: %v", err)
+						break loop
+					}
+				}
 			}
 			_, err = conn.Write(resp)
 			if err != nil {
 				log.Println(err)
 				break loop
+			} else if fType == CLOSE {
+				break loop
 			}
 		}
 	}
-
+	conn.Close()
 }
 
 // handleRequests is run as a goroutine to handle every new connection request
