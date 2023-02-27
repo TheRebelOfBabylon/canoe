@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ const (
 	CLOSE
 	PING
 	PONG
+	PACKET_ACK
 )
 
 type StatusTypes uint8
@@ -177,7 +179,20 @@ func (t TransferAck) Serialize() []byte {
 // Packet encrypted with session key, sent over UDP
 type Packet struct {
 	OrderNumber uint32
-	Data        string // base64 encoded data
+	Data        []byte
+	Checksum    uint64
+}
+
+func (p Packet) Serialize() []byte {
+	var b []byte
+	orderBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(orderBytes, p.OrderNumber)
+	b = append(b, orderBytes...)
+	checksumBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(checksumBytes, p.Checksum)
+	b = append(b, checksumBytes...)
+	b = append(b, p.Data...)
+	return b[:]
 }
 
 // Encrypted with session key
@@ -216,4 +231,8 @@ type Pong struct{}
 
 func (p Pong) Serialize() []byte {
 	return []byte(`"pong"`)
+}
+
+type PacketAck struct {
+	OrderNumbers []uint32 `json:"order_numbers"`
 }

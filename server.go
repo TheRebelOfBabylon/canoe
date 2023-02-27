@@ -12,6 +12,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 
 	bg "github.com/SSSOCPaulCote/blunderguard"
@@ -21,6 +23,8 @@ import (
 const (
 	ErrVersionMismatch  = bg.Error("protocol version mismatch")
 	ErrWeakHandshakeKey = bg.Error("weak handshake key")
+	ErrUnsupportedType  = bg.Error("unsupported transfer type")
+	ErrFileTooLarge     = bg.Error("file size is too large")
 )
 
 var (
@@ -31,6 +35,7 @@ var (
 type ServerConfig struct {
 	privateKey *rsa.PrivateKey
 	Rand       io.Reader
+	WorkingDir string
 }
 
 // AddHostKey is a method for registering a private key in the server config
@@ -151,7 +156,29 @@ func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte) (MsgTypes, []byte
 		if err != nil {
 			return createErrCloseFrame(err, sessionKey)
 		}
-		// TODO - Implement this
+		// check transfer type
+		if msg.Type != FILE {
+			return createErrCloseFrame(ErrUnsupportedType, sessionKey)
+		}
+		// unmarshall init
+		init := FileTransferInit{}
+		err = json.Unmarshal(msg.Payload, &init)
+		if err != nil {
+			return createErrCloseFrame(err, sessionKey)
+		}
+		// ensure our working dir has space for this file
+		freeSpace, err := GetDirAvailableSpace(s.cfg.WorkingDir)
+		if err != nil {
+			return createErrCloseFrame(err, sessionKey)
+		}
+		if freeSpace < init.FileSize {
+			return createErrCloseFrame(ErrFileTooLarge, sessionKey)
+		}
+		// Ensure our working dir doesn't already have a file with that name
+		if _, err := os.Open(filepath.Join(s.cfg.WorkingDir, init.FileName)); err != nil {
+			return createErrCloseFrame(err, sessionKey)
+		}
+		// Start up a UDP server
 		fmt.Println(msg)
 		// Make TransferAck
 		ack := TransferAck{

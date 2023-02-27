@@ -7,4 +7,5 @@ require (
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/traefik/yaegi v0.15.0 // indirect
+	golang.org/x/sys v0.5.0 // indirect
 )
