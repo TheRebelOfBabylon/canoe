@@ -70,7 +70,7 @@ func fletcher64(data []byte) uint64 {
 	return (sum2 << 32) | sum1
 }
 
-//NewUDPClient will initialize the UDP client
+// NewUDPClient will initialize the UDP client
 func NewUDPClient(host string, key []byte) (*UDPClient, error) {
 	addr, err := net.ResolveUDPAddr("udp", host)
 	if err != nil {

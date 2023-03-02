@@ -1,6 +1,8 @@
 package canoe
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -8,6 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	bg "github.com/SSSOCPaulCote/blunderguard"
+)
+
+const (
+	ErrInvalidChecksum = bg.Error("invalid checksum")
 )
 
 type MsgTypes uint8
@@ -193,6 +201,34 @@ func (p Packet) Serialize() []byte {
 	b = append(b, checksumBytes...)
 	b = append(b, p.Data...)
 	return b[:]
+}
+
+// DecryptPacket will take an encrypted packet, decrypt it and parse it
+func DecryptPacket(p []byte, key []byte) (Packet, error) {
+	decryptedPacket, err := DecryptAESGCM(p, key)
+	if err != nil {
+		return Packet{}, err
+	}
+	// ensure the checksum is intact
+	checksum := binary.LittleEndian.Uint64(decryptedPacket[4:16])
+	if checksum != fletcher64(decryptedPacket[16:]) {
+		return Packet{}, ErrInvalidChecksum
+	}
+	gz, err := gzip.NewReader(bytes.NewBuffer(decryptedPacket[16:]))
+	if err != nil {
+		return Packet{}, err
+	}
+	decompressed := make([]byte, int(float64(len(decryptedPacket[16:]))/0.7))
+	bytesRead, err := gz.Read(decompressed)
+	if err != nil {
+		return Packet{}, err
+	}
+	data := decompressed[:bytesRead]
+	return Packet{
+		OrderNumber: binary.LittleEndian.Uint32(decryptedPacket[:4]),
+		Data:        data[:],
+		Checksum:    checksum,
+	}, nil
 }
 
 // Encrypted with session key

@@ -2,6 +2,7 @@ package canoe
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,44 +21,49 @@ type (
 		IsConnected bool
 		Signal      chan int
 	}
-	ByteQueue struct {
-		queue     [][]byte
+	RcvPacketQueue struct {
+		queue     []Packet
 		listeners map[string]*QueueListener
 		sync.RWMutex
 	}
+	AckedMap struct {
+		ackedMap map[int]bool
+		sync.RWMutex
+	}
 	UDPServer struct {
-		queue      *ByteQueue
+		queue      *RcvPacketQueue
 		sessionkey []byte
 		numPackets uint32
 		conn       *net.UDPConn
 		workingDir string
+		ackedMap   *AckedMap
 	}
 )
 
-// NewByteQueue instantiates a new ByteQueue struct
-func NewByteQueue() *ByteQueue {
-	return &ByteQueue{
-		queue:     [][]byte{},
+// NewRcvPacketQueue instantiates a new ByteQueue struct
+func NewRcvPacketQueue() *RcvPacketQueue {
+	return &RcvPacketQueue{
+		queue:     []Packet{},
 		listeners: make(map[string]*QueueListener),
 	}
 }
 
 // Pop returns the first item in the queue and deletes it from the queue
-func (q *ByteQueue) Pop() []byte {
+func (q *RcvPacketQueue) Pop() Packet {
 	q.Lock()
 	defer q.Unlock()
-	var item []byte
+	var item Packet
 	if len(q.queue) > 0 {
 		item = q.queue[0]
 		q.queue = q.queue[1:]
 	} else {
-		q.queue = [][]byte{}
+		q.queue = []Packet{}
 	}
 	return item
 }
 
 // Push adds a new item to the back of the queue
-func (q *ByteQueue) Push(v []byte) {
+func (q *RcvPacketQueue) Push(v Packet) {
 	q.Lock()
 	defer q.Unlock()
 	q.queue = append(q.queue, v)
@@ -74,7 +80,7 @@ func (q *ByteQueue) Push(v []byte) {
 }
 
 // Subscribe returns a channel which will have signals sent when a new item is pushed as well as an unsub function
-func (q *ByteQueue) Subscribe(name string) (chan int, func(), error) {
+func (q *RcvPacketQueue) Subscribe(name string) (chan int, func(), error) {
 	q.Lock()
 	defer q.Unlock()
 	if _, ok := q.listeners[name]; ok {
@@ -89,13 +95,32 @@ func (q *ByteQueue) Subscribe(name string) (chan int, func(), error) {
 	return q.listeners[name].Signal, unsub, nil
 }
 
+// newAckedMap creates a new AckedMap data structure
+func newAckedMap(numPackets uint32) *AckedMap {
+	aMap := make(map[int]bool)
+	for i := 0; i < int(numPackets); i++ {
+		aMap[i+1] = false
+	}
+	return &AckedMap{
+		ackedMap: aMap,
+	}
+}
+
+// Ack will update the ACK status for a particular packet
+func (a *AckedMap) Ack(n int) {
+	a.Lock()
+	defer a.Unlock()
+	a.ackedMap[n] = true
+}
+
 // NewUDPServer instantiates a new UDPServer struct
 func NewUDPServer(sessionKey []byte, numPackets uint32, workingDir string) *UDPServer {
 	return &UDPServer{
 		sessionkey: sessionKey,
 		numPackets: numPackets,
-		queue:      NewByteQueue(),
+		queue:      NewRcvPacketQueue(),
 		workingDir: workingDir,
+		ackedMap:   newAckedMap(numPackets),
 	}
 }
 
@@ -118,21 +143,28 @@ func (u *UDPServer) ListenAndServe(port uint16, fileName string) error {
 // handleConnection is the goroutine for handling incoming connections
 func (u *UDPServer) handleConnection(fileName string) {
 	quitChan := make(chan struct{})
-	defer close(quitChan)
 	go u.handlePackets(fileName, quitChan)
-	for i := 0; i < int(u.numPackets); i++ {
-		buffer := make([]byte, 4096)
-		bytesRead, _, err := u.conn.ReadFromUDP(buffer)
-		if err != nil {
+	for {
+		buffer := make([]byte, 2048)
+		bytesRead, err := u.conn.Read(buffer)
+		if err == io.EOF {
+			// wait for handlePackets to finish up on it's own
+		} else if err != nil {
 			fmt.Println(err)
-			break
+			close(quitChan)
+			return
 		}
-		u.queue.Push(buffer[:bytesRead])
+		packet, err := DecryptPacket(buffer[:bytesRead], u.sessionkey)
+		if err == nil {
+			// TODO - Instead this should push to an Ack queue and a go routine in server.go will push the ACK message down the TCP connection
+			// u.ackedMap.Ack(int(packet.OrderNumber))
+			u.queue.Push(packet)
+		}
 	}
 }
 
 // handlePackets is the goroutine which will read packets from a queue
-// unpack them and write them to the file
+// and write them to the file
 func (u *UDPServer) handlePackets(fileName string, quit chan struct{}) {
 	file, err := os.Create(filepath.Join(u.workingDir, fileName))
 	if err != nil {
@@ -150,12 +182,8 @@ func (u *UDPServer) handlePackets(fileName string, quit chan struct{}) {
 		select {
 		case i := <-sigChan:
 			if i != 0 {
-				unencryptedPacket, err := DecryptAESGCM(u.queue.Pop(), u.sessionkey)
-				if err != nil {
-					fmt.Println(err)
-					return
-				}
-				_, err = file.Write(unencryptedPacket)
+				packet := u.queue.Pop()
+				_, err = file.Write(packet.Data)
 				if err != nil {
 					fmt.Println(err)
 					return
