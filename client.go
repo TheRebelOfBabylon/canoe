@@ -12,7 +12,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
+	"sync"
+	"time"
 
 	bg "github.com/SSSOCPaulCote/blunderguard"
 )
@@ -21,6 +24,10 @@ const (
 	ErrNoPrivateKey    = bg.Error("no private key found")
 	ErrInvalidResponse = bg.Error("invalid response from server")
 	ErrWeakSessionkey  = bg.Error("weak session key")
+)
+
+var (
+	udpTimeout = 100 * time.Millisecond
 )
 
 type ClientConfig struct {
@@ -38,6 +45,7 @@ type Client struct {
 	tcpConn    *net.TCPConn
 	cfg        *ClientConfig
 	sessionKey []byte
+	sync.WaitGroup
 }
 
 // Dial starts a client connection to the given canoe server. It is a convenience function to the given network address
@@ -178,7 +186,7 @@ func handleClose(f *Frame, key []byte) error {
 }
 
 // Send sends a serialized message to the server
-func (c *Client) Send(pay []byte, msgType MsgTypes) error {
+func (c *Client) send(pay []byte, msgType MsgTypes) error {
 	encryptedPay, err := EncryptAESGCM(pay, c.sessionKey)
 	if err != nil {
 		return err
@@ -188,6 +196,39 @@ func (c *Client) Send(pay []byte, msgType MsgTypes) error {
 		Payload: base64.StdEncoding.EncodeToString(encryptedPay),
 	}
 	_, err = c.tcpConn.Write(frame.Serialize())
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Close ends the TCP connection
+func (c *Client) Close() error {
+	return c.tcpConn.Close()
+}
+
+func (c *Client) SendFile(pathToFile string) error {
+	// First let's ensure the file exists and get info on it
+	info, err := os.Stat(pathToFile)
+	if err != nil {
+		return err
+	}
+	packetQueue, err := createPackets(pathToFile, c.sessionKey)
+	if err != nil {
+		return err
+	}
+	// Build our put request
+	init := PutFileTransferInit{
+		FileName:        info.Name(),
+		FileSize:        uint64(info.Size()),
+		NumberOfPackets: uint32(len(packetQueue.Queue)),
+	}
+	initFrame := TransferFrame{
+		Type:    PUT_FILE,
+		Payload: init.Serialize(),
+	}
+	// Send the request
+	err = c.send(initFrame.Serialize(), TRANSFER_INIT)
 	if err != nil {
 		return err
 	}
@@ -205,46 +246,136 @@ func (c *Client) Send(pay []byte, msgType MsgTypes) error {
 	}
 	if f.Type == CLOSE {
 		return handleClose(&f, c.sessionKey)
+	} else if f.Type != TRANSFER_ACK {
+		return ErrInvalidResponse
 	}
-	switch frame.Type {
-	case TRANSFER_INIT:
-		// then we expect a TransferAck
-		// Parse what should be ACK
-		if f.Type != TRANSFER_ACK {
-			return ErrInvalidResponse
-		}
-		// decode payload
-		decodePay, err := base64.StdEncoding.DecodeString(f.Payload)
-		if err != nil {
-			return err
-		}
-		// decrypt with session key
-		decryptedPay, err := DecryptAESGCM(decodePay, c.sessionKey)
-		if err != nil {
-			return err
-		}
-		// unmarshall ackframe
-		var ackFrame AckFrame
-		err = json.Unmarshal(decryptedPay, &ackFrame)
-		if err != nil {
-			return err
-		}
-		fmt.Println(ackFrame)
-		if ackFrame.Status != OK {
-			return errors.New(string(ackFrame.Payload))
-		}
-		// unmarshall ack
-		var ack TransferAck
-		err = json.Unmarshal(ackFrame.Payload, &ack)
-		if err != nil {
-			return err
-		}
-		fmt.Println(ack)
+	// decode payload
+	decodePay, err := base64.StdEncoding.DecodeString(f.Payload)
+	if err != nil {
+		return err
 	}
+	// decrypt with session key
+	decryptedPay, err := DecryptAESGCM(decodePay, c.sessionKey)
+	if err != nil {
+		return err
+	}
+	// unmarshall ackframe
+	var ackFrame AckFrame
+	err = json.Unmarshal(decryptedPay, &ackFrame)
+	if err != nil {
+		return err
+	}
+	fmt.Println(ackFrame)
+	if ackFrame.Status != OK {
+		return errors.New(string(ackFrame.Payload))
+	}
+	// unmarshall ack
+	var ack TransferAck
+	err = json.Unmarshal(ackFrame.Payload, &ack)
+	if err != nil {
+		return err
+	}
+	fmt.Println(ack)
+	// let's create a UDP client
+	udpClient, err := NewUDPClient(c.tcpConn.RemoteAddr().(*net.TCPAddr).IP.String()+fmt.Sprintf(":%v", ack.UDPPort), c.sessionKey)
+	if err != nil {
+		return err
+	}
+	defer udpClient.Close()
+	quitChan := make(chan struct{})
+	c.Add(1)
+	// handleAcks will update the packetQueue acked status whenever a packet ack is received
+	// it will exit when the main sending loop exits
+	go c.handleAcks(packetQueue, quitChan)
+	for {
+		acked := 0
+		for i, packet := range packetQueue.Queue {
+			if !packet.Acked && packetQueue.CanSend(i, udpTimeout) {
+				_, err := udpClient.conn.Write(packet.EncryptedPacket)
+				if err != nil {
+					close(quitChan)
+					fmt.Println(err)
+					packetQueue.RUnlock()
+					return err
+				}
+				packetQueue.TimeSent(i, time.Now())
+			} else if packet.Acked {
+				acked += 1
+			}
+		}
+		if acked == len(packetQueue.Queue) {
+			close(quitChan)
+			break
+		}
+	}
+	c.Wait()
 	return nil
 }
 
-// Close ends the TCP connection
-func (c *Client) Close() error {
-	return c.tcpConn.Close()
+// handleAcks is a dedicated goroutine for reading messages on the TCP connection and updating
+// the packet queue ack statuses
+func (c *Client) handleAcks(q *PacketQueue, quitChan chan struct{}) {
+	defer c.Done()
+	for {
+		buffer := make([]byte, 4096)
+		select {
+		case <-quitChan:
+			return
+		default:
+			_, err := c.tcpConn.Read(buffer)
+			if err == io.EOF {
+				return
+			} else if err != nil {
+				fmt.Println(err)
+			}
+			// parse the received data
+			orderNumbers, err := c.parsePacketAck(bytes.Trim(buffer, "\x00"))
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			// update the packets that have been acked
+			for _, num := range orderNumbers {
+				if !q.IsAck(int(num - 1)) {
+					q.Ack(int(num - 1))
+				}
+			}
+		}
+	}
+}
+
+// parsePacketAck will parse the JSON bytes, decrypt and decode to get the list of packets that were acked
+func (c *Client) parsePacketAck(b []byte) ([]uint32, error) {
+	var f Frame
+	err := json.Unmarshal(b, &f)
+	if err != nil {
+		return nil, err
+	}
+	if f.Type != PACKET_ACK {
+		return nil, ErrInvalidResponse
+	}
+	// decode and decrypt payload
+	decodedPay, err := base64.StdEncoding.DecodeString(f.Payload)
+	if err != nil {
+		return nil, err
+	}
+	decryptedPay, err := DecryptAESGCM(decodedPay, c.sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	// unmarshal json payload
+	var ackFrame AckFrame
+	err = json.Unmarshal(decryptedPay, &ackFrame)
+	if err != nil {
+		return nil, err
+	}
+	if ackFrame.Status != OK {
+		return nil, ErrInvalidResponse
+	}
+	var packetAck PacketAck
+	err = json.Unmarshal(ackFrame.Payload, &packetAck)
+	if err != nil {
+		return nil, err
+	}
+	return packetAck.OrderNumbers, nil
 }

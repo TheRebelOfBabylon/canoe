@@ -133,7 +133,7 @@ func (h HandshakeAck) Sign(privateKey *rsa.PrivateKey, rand io.Reader) ([]byte, 
 type TransferTypes uint8
 
 const (
-	FILE TransferTypes = iota // Can support other TransferTypes in the future
+	PUT_FILE TransferTypes = iota // Can support other TransferTypes in the future
 )
 
 type TransferFrame struct {
@@ -151,18 +151,18 @@ func (t TransferFrame) String() string {
 }
 
 // encrypted with session key
-type FileTransferInit struct {
+type PutFileTransferInit struct {
 	FileSize        uint64 `json:"file_size"`         // bytes
 	FileName        string `json:"file_name"`         // filename.ext
-	NumberOfPackets uint32 `json:"number_of_packets"` // Files are broken down into 1024 byte sized packets
+	NumberOfPackets uint32 `json:"number_of_packets"` // total number of packets to be transfered
 }
 
-func (t FileTransferInit) Serialize() []byte {
+func (t PutFileTransferInit) Serialize() []byte {
 	b, _ := json.Marshal(t)
 	return b[:]
 }
 
-func (t FileTransferInit) String() string {
+func (t PutFileTransferInit) String() string {
 	return fmt.Sprintf("FileSize=%v\nFileName=%s\nNumberOfPackets=%v", t.FileSize, t.FileName, t.NumberOfPackets)
 }
 

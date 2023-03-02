@@ -4,18 +4,59 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"net"
 	"os"
+	"sync"
+	"time"
+)
+
+var (
+	dataSize = 1456
 )
 
 type (
 	UDPClient struct {
 		sessionKey []byte
+		conn       *net.UDPConn
 	}
-	PacketListItem struct {
+	PacketQueueItem struct {
 		EncryptedPacket []byte
-		OrderNumber     uint32
+		Acked           bool
+		TimeSent        time.Time
+	}
+	PacketQueue struct {
+		Queue []PacketQueueItem
+		sync.RWMutex
 	}
 )
+
+// Ack changes the Acked status of a packet to true
+func (q *PacketQueue) Ack(orderNumber int) {
+	q.Lock()
+	defer q.Unlock()
+	q.Queue[orderNumber].Acked = true
+}
+
+// IsAck determines if a given packet was acked by the server
+func (q *PacketQueue) IsAck(orderNumber int) bool {
+	q.RLock()
+	defer q.RUnlock()
+	return q.Queue[orderNumber].Acked
+}
+
+// CanSend determines if a given packet has timed out and if it hasn't already been acked by the server
+func (q *PacketQueue) CanSend(orderNumber int, timeout time.Duration) bool {
+	q.RLock()
+	defer q.RUnlock()
+	return time.Now().After(q.Queue[orderNumber].TimeSent.Add(timeout)) && !q.Queue[orderNumber].Acked
+}
+
+// TimeSent updates the TimeSent parameter for a given packet
+func (q *PacketQueue) TimeSent(orderNumber int, timeSent time.Time) {
+	q.Lock()
+	defer q.Unlock()
+	q.Queue[orderNumber].TimeSent = timeSent
+}
 
 // fletcher64 implements the Fletcher checksum algorithm
 // Data is split into 64bit words
@@ -29,20 +70,37 @@ func fletcher64(data []byte) uint64 {
 	return (sum2 << 32) | sum1
 }
 
+//NewUDPClient will initialize the UDP client
+func NewUDPClient(host string, key []byte) (*UDPClient, error) {
+	addr, err := net.ResolveUDPAddr("udp", host)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+	return &UDPClient{
+		sessionKey: key[:],
+		conn:       conn,
+	}, nil
+}
+
 // createPackets will open a file, separate it into packets, compress the packets, encrypt them and order them
-// UDP packets can be at most 65507 bytes, IP header is 20 bytes, UDP header is 8 bytes
+// Typical NIC MTU is 1500 Bytes, IP header is 20 bytes, UDP header is 8 bytes
 // Order number is 4 bytes and the checksum is 8 bytes
-func (u *UDPClient) createPackets(pathToFile string, maxPacketSize int) ([]PacketListItem, error) {
-	var packets []PacketListItem
-	dataSize := (maxPacketSize - 4 - 8 - maxPacketSize%8) / 8 // To maximimze efficiency when computing the checksum, we make sure that dataSize is evenly divisible by 8 (64 bits = 8 bytes)
+// We want our data to be a multiple of 8 since that is most efficient with our checksum algorithm
+// dataSize is therefore 1456 bytes
+func createPackets(pathToFile string, sessionKey []byte) (*PacketQueue, error) {
+	var packets []PacketQueueItem
 	// open the File
 	file, err := os.Open(pathToFile)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	gzB := make([]byte, dataSize-28)                 // the encrypted data will always be 28 bytes longer
-	b := make([]byte, int(float64(dataSize-28)/0.7)) // gzip compression can sometimes hit 70% efficiency so we make a buffer that big
+	gzB := make([]byte, dataSize)                 // the encrypted data will always be 28 bytes longer
+	b := make([]byte, int(float64(dataSize)/0.7)) // gzip compression can sometimes hit 70% efficiency so we make a buffer that big
 	gzBuf := bytes.NewBuffer(gzB)
 	gz := gzip.NewWriter(gzBuf)
 	if err != nil {
@@ -75,12 +133,24 @@ func (u *UDPClient) createPackets(pathToFile string, maxPacketSize int) ([]Packe
 		// Compute the checksum
 		newPacket.Checksum = fletcher64(newPacket.Data[:])
 		// encrypt the packet
-		encryptedPacket, err := EncryptAESGCM(newPacket.Serialize(), u.sessionKey)
+		encryptedPacket, err := EncryptAESGCM(newPacket.Serialize(), sessionKey)
 		if err != nil {
 			return nil, err
 		}
-		packets = append(packets, PacketListItem{EncryptedPacket: encryptedPacket[:], OrderNumber: seq})
+		packets = append(packets, PacketQueueItem{EncryptedPacket: encryptedPacket[:]})
 		seq += 1
 	}
-	return packets, nil
+	return &PacketQueue{
+		Queue: packets,
+	}, nil
+}
+
+// Close will properly close the UDP client connection
+func (c *UDPClient) Close() error {
+	return c.conn.Close()
+}
+
+// Buffer creates a new appropriately sized buffer
+func (c *UDPClient) Buffer() []byte {
+	return make([]byte, dataSize)
 }

@@ -157,11 +157,11 @@ func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte) (MsgTypes, []byte
 			return createErrCloseFrame(err, sessionKey)
 		}
 		// check transfer type
-		if msg.Type != FILE {
+		if msg.Type != PUT_FILE {
 			return createErrCloseFrame(ErrUnsupportedType, sessionKey)
 		}
 		// unmarshall init
-		init := FileTransferInit{}
+		init := PutFileTransferInit{}
 		err = json.Unmarshal(msg.Payload, &init)
 		if err != nil {
 			return createErrCloseFrame(err, sessionKey)
