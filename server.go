@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -43,13 +42,75 @@ func (s *ServerConfig) AddHostKey(key *rsa.PrivateKey) {
 	s.privateKey = key
 }
 
-type Server struct {
-	Version   uint8
-	tcpLis    net.Listener
-	quit      chan struct{}
-	closeConn map[string]chan struct{}
-	wg        sync.WaitGroup
-	cfg       *ServerConfig
+type (
+	Server struct {
+		Version   uint8
+		tcpLis    net.Listener
+		quit      chan struct{}
+		closeConn map[string]chan struct{}
+		wg        sync.WaitGroup
+		cfg       *ServerConfig
+	}
+	AckQueue struct {
+		queue     []uint32
+		listeners map[string]*QueueListener
+		sync.RWMutex
+	}
+)
+
+// NewAckQueue creates an instance of the AckQueue
+func NewAckQueue() *AckQueue {
+	return &AckQueue{
+		queue:     []uint32{},
+		listeners: make(map[string]*QueueListener),
+	}
+}
+
+// Push adds a new item to the queue
+func (q *AckQueue) Push(v int) {
+	q.Lock()
+	defer q.Unlock()
+	q.queue = append(q.queue, uint32(v))
+	newListenerMap := make(map[string]*QueueListener)
+	for n, l := range q.listeners {
+		if !l.IsConnected {
+			close(l.Signal)
+			continue
+		}
+		l.Signal <- len(q.queue) + 1 // + 1 because then the subscriber can know when the channel is closed (if they receive 0)
+		newListenerMap[n] = l
+	}
+	q.listeners = newListenerMap
+}
+
+// Pop removes the first item in the queue and returns its value
+func (q *AckQueue) Pop() uint32 {
+	q.Lock()
+	defer q.Unlock()
+	var item uint32
+	if len(q.queue) > 0 {
+		item = q.queue[0]
+		q.queue = q.queue[1:]
+	} else {
+		q.queue = []uint32{}
+	}
+	return item
+}
+
+// Subscribe returns a channel which will have signals sent when a new item is pushed as well as an unsub function
+func (q *AckQueue) Subscribe(name string) (chan int, func(), error) {
+	q.Lock()
+	defer q.Unlock()
+	if _, ok := q.listeners[name]; ok {
+		return nil, nil, ErrAlreadySubscribed
+	}
+	q.listeners[name] = &QueueListener{IsConnected: true, Signal: make(chan int, 2)}
+	unsub := func() {
+		q.Lock()
+		defer q.Unlock()
+		q.listeners[name].IsConnected = false
+	}
+	return q.listeners[name].Signal, unsub, nil
 }
 
 // NewServer creates a new instance of Server
@@ -64,7 +125,7 @@ func NewServer(config *ServerConfig) *Server {
 }
 
 // handleMsg will take the TCP message, decode and decrypt as necessary and then create the appropriate response
-func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte) (MsgTypes, []byte, error) {
+func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte, conn net.Conn, connId string) (MsgTypes, []byte, error) {
 	var (
 		f     Frame
 		frame Frame
@@ -179,7 +240,17 @@ func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte) (MsgTypes, []byte
 			return createErrCloseFrame(err, sessionKey)
 		}
 		// Start up a UDP server
-		fmt.Println(msg)
+		// create AckQueue
+		ackQueue := NewAckQueue()
+		udp := NewUDPServer(sessionKey, init.NumberOfPackets, s.cfg.WorkingDir)
+		err = udp.ListenAndServe(defaultUDPPort, init.FileName, ackQueue)
+		if err != nil {
+			return createErrCloseFrame(err, sessionKey)
+		}
+		quitChan := make(chan struct{})
+		s.closeConn[connId+"sendAck"] = quitChan
+		// goroutine to sendAcks
+		go s.sendAcks(ackQueue, init.NumberOfPackets, conn, connId, sessionKey, quitChan)
 		// Make TransferAck
 		ack := TransferAck{
 			UDPPort: defaultUDPPort,
@@ -199,6 +270,73 @@ func (s *Server) handleMsg(msgBytes []byte, sessionKey []byte) (MsgTypes, []byte
 		frame.Payload = base64.StdEncoding.EncodeToString(encryptedPayload)
 	}
 	return fType, frame.Serialize(), nil
+}
+
+// createAckPacket creates the serialized and encrypted ack packet for a given received packet
+func createAckPacket(orderNum uint32, sessionKey []byte) ([]byte, error) {
+	ackPacket := PacketAck{
+		OrderNumber: orderNum,
+	}
+	ackFrame := AckFrame{
+		Status:  OK,
+		Payload: ackPacket.Serialize(),
+	}
+	encryptedAck, err := EncryptAESGCM(ackFrame.Serialize(), sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	encodedAck := base64.StdEncoding.EncodeToString(encryptedAck)
+	frame := Frame{
+		Type:    PACKET_ACK,
+		Payload: encodedAck,
+	}
+	return frame.Serialize(), nil
+}
+
+// sendAcks is the dedicated goroutine for sending acks whenever the ack queue is updated
+func (s *Server) sendAcks(q *AckQueue, numOfPackets uint32, conn net.Conn, connId string, sessionKey []byte, quitChan chan struct{}) {
+	defer s.wg.Done()
+	// first let's make a map of ints and bools to keep track of which packets have been acked or not
+	ackMap := make(map[int]bool)
+	for i := 1; i != int(numOfPackets)+1; i++ {
+		ackMap[i] = false
+	}
+	// subscribe to AckQueue
+	sigChan, unsub, err := q.Subscribe(connId)
+	if err != nil {
+		// TODO - Integrate a way to send error messages back to main handler
+		return
+	}
+	defer unsub()
+	// main loop for listening for
+loop:
+	for {
+		select {
+		case k := <-sigChan:
+			for j := 0; j < k; j++ {
+				v := q.Pop()
+				ackBytes, err := createAckPacket(v, sessionKey)
+				if err != nil {
+					return
+				}
+				_, err = conn.Write(ackBytes)
+				if err != nil {
+					return
+				}
+				ackMap[int(v)] = true
+			}
+		case <-quitChan:
+			return
+		default:
+			// if all the values are true then exit
+			for _, v := range ackMap {
+				if !v {
+					continue loop
+				}
+			}
+			return
+		}
+	}
 }
 
 // createErrCloseFrameHandshake creates an unencrypted CLOSE message for the client
@@ -248,7 +386,7 @@ loop:
 				log.Println(err)
 				break loop
 			}
-			fType, resp, err := s.handleMsg(buffer[:], sessionKey)
+			fType, resp, err := s.handleMsg(buffer[:], sessionKey, connId)
 			if err != nil {
 				log.Println(err)
 				if fType != CLOSE {

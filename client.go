@@ -329,53 +329,51 @@ func (c *Client) handleAcks(q *PacketQueue, quitChan chan struct{}) {
 				fmt.Println(err)
 			}
 			// parse the received data
-			orderNumbers, err := c.parsePacketAck(bytes.Trim(buffer, "\x00"))
+			orderNumber, err := c.parsePacketAck(bytes.Trim(buffer, "\x00"))
 			if err != nil {
 				fmt.Println(err)
 				return
 			}
 			// update the packets that have been acked
-			for _, num := range orderNumbers {
-				if !q.IsAck(int(num - 1)) {
-					q.Ack(int(num - 1))
-				}
+			if !q.IsAck(int(orderNumber - 1)) {
+				q.Ack(int(orderNumber - 1))
 			}
 		}
 	}
 }
 
 // parsePacketAck will parse the JSON bytes, decrypt and decode to get the list of packets that were acked
-func (c *Client) parsePacketAck(b []byte) ([]uint32, error) {
+func (c *Client) parsePacketAck(b []byte) (uint32, error) {
 	var f Frame
 	err := json.Unmarshal(b, &f)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if f.Type != PACKET_ACK {
-		return nil, ErrInvalidResponse
+		return 0, ErrInvalidResponse
 	}
 	// decode and decrypt payload
 	decodedPay, err := base64.StdEncoding.DecodeString(f.Payload)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	decryptedPay, err := DecryptAESGCM(decodedPay, c.sessionKey)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	// unmarshal json payload
 	var ackFrame AckFrame
 	err = json.Unmarshal(decryptedPay, &ackFrame)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if ackFrame.Status != OK {
-		return nil, ErrInvalidResponse
+		return 0, ErrInvalidResponse
 	}
 	var packetAck PacketAck
 	err = json.Unmarshal(ackFrame.Payload, &packetAck)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return packetAck.OrderNumbers, nil
+	return packetAck.OrderNumber, nil
 }

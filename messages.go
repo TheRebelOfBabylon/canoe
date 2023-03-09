@@ -270,5 +270,10 @@ func (p Pong) Serialize() []byte {
 }
 
 type PacketAck struct {
-	OrderNumbers []uint32 `json:"order_numbers"`
+	OrderNumber uint32 `json:"order_numbers"`
+}
+
+func (a PacketAck) Serialize() []byte {
+	b, _ := json.Marshal(a)
+	return b[:]
 }

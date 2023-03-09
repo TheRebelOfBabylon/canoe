@@ -26,17 +26,12 @@ type (
 		listeners map[string]*QueueListener
 		sync.RWMutex
 	}
-	AckedMap struct {
-		ackedMap map[int]bool
-		sync.RWMutex
-	}
 	UDPServer struct {
 		queue      *RcvPacketQueue
 		sessionkey []byte
 		numPackets uint32
 		conn       *net.UDPConn
 		workingDir string
-		ackedMap   *AckedMap
 	}
 )
 
@@ -95,24 +90,6 @@ func (q *RcvPacketQueue) Subscribe(name string) (chan int, func(), error) {
 	return q.listeners[name].Signal, unsub, nil
 }
 
-// newAckedMap creates a new AckedMap data structure
-func newAckedMap(numPackets uint32) *AckedMap {
-	aMap := make(map[int]bool)
-	for i := 0; i < int(numPackets); i++ {
-		aMap[i+1] = false
-	}
-	return &AckedMap{
-		ackedMap: aMap,
-	}
-}
-
-// Ack will update the ACK status for a particular packet
-func (a *AckedMap) Ack(n int) {
-	a.Lock()
-	defer a.Unlock()
-	a.ackedMap[n] = true
-}
-
 // NewUDPServer instantiates a new UDPServer struct
 func NewUDPServer(sessionKey []byte, numPackets uint32, workingDir string) *UDPServer {
 	return &UDPServer{
@@ -120,13 +97,12 @@ func NewUDPServer(sessionKey []byte, numPackets uint32, workingDir string) *UDPS
 		numPackets: numPackets,
 		queue:      NewRcvPacketQueue(),
 		workingDir: workingDir,
-		ackedMap:   newAckedMap(numPackets),
 	}
 }
 
 // ListenAndServe will create a UDP listener on the given port and spin up
 // a goroutine to handle incoming connections
-func (u *UDPServer) ListenAndServe(port uint16, fileName string) error {
+func (u *UDPServer) ListenAndServe(port uint16, fileName string, q *AckQueue) error {
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%v", port))
 	if err != nil {
 		return err
@@ -136,14 +112,14 @@ func (u *UDPServer) ListenAndServe(port uint16, fileName string) error {
 		return err
 	}
 	u.conn = conn
-	go u.handleConnection(fileName)
+	go u.handleConnection(fileName, q)
 	return nil
 }
 
 // handleConnection is the goroutine for handling incoming connections
-func (u *UDPServer) handleConnection(fileName string) {
+func (u *UDPServer) handleConnection(fileName string, q *AckQueue) {
 	quitChan := make(chan struct{})
-	go u.handlePackets(fileName, quitChan)
+	go u.handlePackets(fileName, quitChan, q)
 	for {
 		buffer := make([]byte, 2048)
 		bytesRead, err := u.conn.Read(buffer)
@@ -165,11 +141,16 @@ func (u *UDPServer) handleConnection(fileName string) {
 
 // handlePackets is the goroutine which will read packets from a queue
 // and write them to the file
-func (u *UDPServer) handlePackets(fileName string, quit chan struct{}) {
+func (u *UDPServer) handlePackets(fileName string, quit chan struct{}, q *AckQueue) {
 	file, err := os.Create(filepath.Join(u.workingDir, fileName))
 	if err != nil {
 		fmt.Println(err)
 		return
+	}
+	defer file.Close()
+	ackMap := make(map[int]bool)
+	for i := 1; i != int(u.numPackets)+1; i++ {
+		ackMap[i] = false
 	}
 	sigChan, unsub, err := u.queue.Subscribe(uuid.NewString())
 	if err != nil {
@@ -178,6 +159,7 @@ func (u *UDPServer) handlePackets(fileName string, quit chan struct{}) {
 		return
 	}
 	defer unsub()
+loop:
 	for {
 		select {
 		case i := <-sigChan:
@@ -188,8 +170,18 @@ func (u *UDPServer) handlePackets(fileName string, quit chan struct{}) {
 					fmt.Println(err)
 					return
 				}
+				// push an ack to the AckQueue
+				q.Push(int(packet.OrderNumber))
+				ackMap[int(packet.OrderNumber)] = true
 			}
 		case <-quit:
+			return
+		default:
+			for _, v := range ackMap {
+				if !v {
+					continue loop
+				}
+			}
 			return
 		}
 	}
