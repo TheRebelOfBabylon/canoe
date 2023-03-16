@@ -3,6 +3,7 @@ package canoe
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -109,6 +110,7 @@ func createPackets(pathToFile string, sessionKey []byte) (*PacketQueue, error) {
 	defer gz.Close()
 	var seq uint32 = 1
 	for {
+		fmt.Printf("Assembling Packet %v...\n", seq)
 		// Read some data from the file
 		bytesRead, err := file.Read(b)
 		if err == io.EOF {
@@ -117,6 +119,7 @@ func createPackets(pathToFile string, sessionKey []byte) (*PacketQueue, error) {
 			return nil, err
 		}
 		// compress it, hopefully filling our bytes.Buffer
+		fmt.Printf("Compressing...")
 		_, err = gz.Write(b[:bytesRead])
 		if err != nil {
 			return nil, err
@@ -130,9 +133,11 @@ func createPackets(pathToFile string, sessionKey []byte) (*PacketQueue, error) {
 			OrderNumber: seq,
 			Data:        gzBuf.Bytes(),
 		}
+		fmt.Println("Calculating checksum...")
 		// Compute the checksum
 		newPacket.Checksum = fletcher64(newPacket.Data[:])
 		// encrypt the packet
+		fmt.Println("encrypting packet...")
 		encryptedPacket, err := EncryptAESGCM(newPacket.Serialize(), sessionKey)
 		if err != nil {
 			return nil, err

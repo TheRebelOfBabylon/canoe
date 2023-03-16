@@ -213,10 +213,12 @@ func (c *Client) SendFile(pathToFile string) error {
 	if err != nil {
 		return err
 	}
+	fmt.Printf("Creating packets for %v....\n", info.Name())
 	packetQueue, err := createPackets(pathToFile, c.sessionKey)
 	if err != nil {
 		return err
 	}
+	fmt.Println("Packets created. Sending file transfer request...")
 	// Build our put request
 	init := PutFileTransferInit{
 		FileName:        info.Name(),
@@ -276,6 +278,7 @@ func (c *Client) SendFile(pathToFile string) error {
 		return err
 	}
 	fmt.Println(ack)
+	fmt.Println("Starting UDP connection....")
 	// let's create a UDP client
 	udpClient, err := NewUDPClient(c.tcpConn.RemoteAddr().(*net.TCPAddr).IP.String()+fmt.Sprintf(":%v", ack.UDPPort), c.sessionKey)
 	if err != nil {
@@ -286,6 +289,7 @@ func (c *Client) SendFile(pathToFile string) error {
 	c.Add(1)
 	// handleAcks will update the packetQueue acked status whenever a packet ack is received
 	// it will exit when the main sending loop exits
+	fmt.Println("UDP connection established. Starting file transfer...")
 	go c.handleAcks(packetQueue, quitChan)
 	for {
 		acked := 0
@@ -309,6 +313,7 @@ func (c *Client) SendFile(pathToFile string) error {
 		}
 	}
 	c.Wait()
+	fmt.Println("File transfer complete")
 	return nil
 }
 

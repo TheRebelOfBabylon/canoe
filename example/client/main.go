@@ -43,17 +43,7 @@ func main() {
 		return
 	}
 	defer client.Close()
-	msg := canoe.PutFileTransferInit{
-		FileSize:        69,
-		FileName:        "boobies.txt",
-		NumberOfPackets: 420,
-	}
-	frame := canoe.TransferFrame{
-		Type:    canoe.FILE,
-		Payload: msg.Serialize(),
-	}
-	// TODO - Update this to use a tester file
-	err = client.Send(frame.Serialize(), canoe.TRANSFER_INIT)
+	err = client.SendFile("test.txt")
 	if err != nil {
 		fmt.Println(err)
 		return

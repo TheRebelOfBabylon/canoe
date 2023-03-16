@@ -386,7 +386,7 @@ loop:
 				log.Println(err)
 				break loop
 			}
-			fType, resp, err := s.handleMsg(buffer[:], sessionKey, connId)
+			fType, resp, err := s.handleMsg(buffer[:], sessionKey, conn, connId)
 			if err != nil {
 				log.Println(err)
 				if fType != CLOSE {
