@@ -3,3 +3,7 @@
 
 # test file
 *.txt
+
+# Added by cargo
+
+/target
