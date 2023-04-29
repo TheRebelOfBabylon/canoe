@@ -4,28 +4,34 @@ use clap::{Args, Parser, Subcommand};
 #[command(author="Paul Côté", version, about, long_about=None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
-
-    #[arg(short, long, default_value_t = 1)]
-    count: u8,
+    command: Commands,    
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about="Adds two numbers")]
-    Add(AddArgs)
+    #[command(about="send a file")]
+    SendFile(SendFileArgs),
+    #[command(about="get a file")]
+    GetFile(GetFileArgs)
 }
 
 #[derive(Args)]
-struct AddArgs {
-    first_number: i16,
-    second_number: i16
+struct SendFileArgs {
+    #[arg(required=true)]
+    path_to_file: String
+}
+
+#[derive(Args)]
+struct GetFileArgs {
+    #[arg(required=true)]
+    file_name: String
 }
 
 fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Add(args) => println!("{} + {} = {}", args.first_number, args.second_number, args.first_number+args.second_number)
+        Commands::SendFile(args) => println!("Sending file {}...", args.path_to_file),
+        Commands::GetFile(args) => println!("Getting file {}...", args.file_name)
     }
 }
