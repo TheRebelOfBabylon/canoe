@@ -7,3 +7,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.2.5", features = ["derive"] }
+home = "0.5.5"
+pem = "2.0.1"
+pqc_kyber = { version="0.6.0", features=["std", "kyber1024"] }
+rand = "0.8.5"
