@@ -23,20 +23,28 @@ pub fn generate_key_pair_files(path_to_file: Option<String>) -> Result<PathBuf, 
     };
     match key_file_path {
         Some(path) => {
-            // println!("key_file_path  = {}", path.to_str().unwrap());
-            // make directory if it doesn't exist
-            let b: bool = path.as_path().is_dir(); 
-            if !b {
-                fs::create_dir_all(path.clone())?;
-            }
-            // generate key pair
-            let mut rng = rand::thread_rng();
-            let key_pair = keypair(&mut rng);
             // create pk sk files
             let mut pk_path = path.clone();
             pk_path.push("id_kyber");
-            let sk_path = pk_path.clone();
+            let mut sk_path = pk_path.clone();
             pk_path.set_extension("pub");
+            // check if path is not to home
+            if path != home::home_dir().unwrap() {
+                // make directoris if they doesn't exist
+                let mut p = path.clone();
+                p.pop();
+                let b: bool = p.as_path().is_dir(); 
+                if !b {
+                    fs::create_dir_all(p)?;
+                }
+                // recreate pk sk files
+                sk_path = path.clone();
+                pk_path = path.clone();
+                pk_path.set_extension("pub");
+            } 
+            // generate key pair
+            let mut rng = rand::thread_rng();
+            let key_pair = keypair(&mut rng);
 
             let mut pk_file = fs::File::create(pk_path)?;
             let mut sk_file = fs::File::create(sk_path)?;
